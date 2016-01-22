@@ -11,7 +11,7 @@
 
 -export([ start/0
         , stop/0
-        , start_link/4
+        , start_link/5
         ]).
 
 -export([ open/2
@@ -81,6 +81,7 @@
          , timeout => timeout()
          }.
 
+-type client_pid() :: pid().
 -type connection() :: pid().
 -type http_verb()  :: get | post | head | delete | patch | put | options.
 -type uri()        :: iodata().
@@ -121,10 +122,10 @@ stop() ->
     application:stop(shotgun).
 
 %% @private
--spec start_link(string(), integer(), connection_type(), open_opts()) ->
+-spec start_link(string(), integer(), connection_type(), open_opts(), client_pid()) ->
     {ok, pid()} | ignore | {error, term()}.
-start_link(Host, Port, Type, Opts) ->
-    gen_fsm:start_link(shotgun, [Host, Port, Type, Opts], []).
+start_link(Host, Port, Type, Opts, ClPid) ->
+    gen_fsm:start_link(shotgun, [Host, Port, Type, Opts, ClPid], []).
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %% API
@@ -154,7 +155,14 @@ open(Host, Port, Opts) when is_map(Opts) ->
            Opts :: open_opts()) ->
     {ok, pid()} | {error, gun_open_failed, gun_open_timeout}.
 open(Host, Port, Type, Opts) ->
-    supervisor:start_child(shotgun_sup, [Host, Port, Type, Opts]).
+    {ok,_} = supervisor:start_child(shotgun_sup, [Host, Port, Type, Opts, self()]),
+    receive
+      {shotgun_open_resp, Resp} -> Resp
+    after 3000 -> 
+      erlang:error(shotgun_open_resp_timeout)
+    end.
+
+
 
 %% @doc Closes the connection with the host.
 -spec close(pid()) -> ok.
@@ -337,8 +345,8 @@ parse_event(EventBin) ->
 
 %% @private
 -spec init([term()]) ->
-    {ok, at_rest, state()} | {stop, gun_open_timeout} | {stop, gun_open_failed}.
-init([Host, Port, Type, Opts]) ->
+    {ok, at_rest, state()}.
+init([Host, Port, Type, Opts, ClPid]) ->
     GunType = case Type of
                   http -> tcp;
                   https -> ssl
@@ -351,19 +359,20 @@ init([Host, Port, Type, Opts]) ->
                },
     Timeout = maps:get(timeout, Opts, 5000),
     {ok, Pid} = gun:open(Host, Port, GunOpts),
-    case gun:await_up(Pid, Timeout) of
+    State = clean_state(),
+    State2 = case gun:await_up(Pid, Timeout) of
       {ok, _} ->
-        State = clean_state(),
-        {ok, at_rest, State#{pid => Pid}};
+        State#{async_resp => {ok, self()}, pid => Pid};
       %The only apparent timeout for gun:open is the connection timeout of the
       %underlying transport. So, a timeout message here comes from gun:await_up.
       {error, timeout} ->
-        {stop, gun_open_timeout};
+        State#{async_resp => {error, gun_open_timeout}};
       %gun currently terminates with reason normal if gun:open fails to open
       %the requested connection. This bubbles up through gun:await_up.
       {error, normal} ->
-        {stop, gun_open_failed}
-    end.
+        State#{async_resp => {error, gun_open_failed}}
+    end,
+    {ok, at_rest, State2#{client_pid => ClPid}, 0}.
 
 %% @private
 -spec handle_event(shutdown, atom(), state()) -> {stop, normal, state()}.
@@ -407,9 +416,11 @@ code_change(_OldVsn, StateName, StateData, _Extra) ->
 
 %% @private
 -spec terminate(term(), atom(), term()) -> ok.
-terminate(_Reason, _StateName, #{pid := Pid} = _State) ->
+terminate(_Reason, _StateName, #{pid := Pid} = _State) when Pid =/= undefined->
     gun:shutdown(Pid),
-    ok.
+    ok;
+terminate(_Reason, _StateName, _State) ->
+  ok.
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %% gen_fsm states
@@ -443,7 +454,14 @@ receive_chunk(Event, From, State) ->
 %See if we have work. If we do, dispatch.
 %If we don't, stay in at_rest.
 %% @private
--spec at_rest(any(), state()) -> {next_state, atom(), state()}.
+-spec at_rest(any(), state()) -> {next_state, atom(), state()} | {stop, normal, state()}.
+at_rest(timeout, State = #{async_resp := R = {error, _}, client_pid := ClPid}) ->
+    ClPid ! {shotgun_open_resp, R},
+  {stop, normal, State};
+at_rest(timeout, State = #{async_resp := R , client_pid := ClPid}) ->
+    NewState = maps:remove(client_pid, maps:remove(async_reps, State)),
+    ClPid ! {shotgun_open_resp, R},
+    {next_state, at_rest, NewState};
 at_rest(timeout, State) ->
     case get_work(State) of
         no_work ->
